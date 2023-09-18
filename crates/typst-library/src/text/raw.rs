@@ -5,7 +5,6 @@ use once_cell::sync::Lazy;
 use once_cell::unsync::Lazy as UnsyncLazy;
 use syntect::highlighting as synt;
 use syntect::parsing::{SyntaxDefinition, SyntaxSet, SyntaxSetBuilder};
-use typst::diag::FileError;
 use typst::eval::Bytes;
 use typst::syntax::{self, LinkedNode};
 use typst::util::option_eq;
@@ -176,18 +175,9 @@ pub struct RawElem {
     ///     (* x (factorial (- x 1)))))
     /// ```
     /// ````
-    #[parse(
-        let (syntaxes, syntaxes_data) = parse_syntaxes(vm, args)?;
-        syntaxes
-    )]
+    #[parse(parse_syntaxes(args)?)]
     #[fold]
-    pub syntaxes: SyntaxPaths,
-
-    /// The raw file buffers of syntax definition files.
-    #[internal]
-    #[parse(syntaxes_data)]
-    #[fold]
-    pub syntaxes_data: Vec<Bytes>,
+    pub syntaxes: Vec<EcoString>,
 
     /// The theme to use for syntax highlighting. Theme files should be in the
     /// in the [`tmTheme` file format](https://www.sublimetext.com/docs/color_schemes_tmtheme.html).
@@ -214,16 +204,8 @@ pub struct RawElem {
     /// #let hi = "Hello World"
     /// ```
     /// ````
-    #[parse(
-        let (theme_path, theme_data) = parse_theme(vm, args)?;
-        theme_path.map(Some)
-    )]
-    pub theme: Option<EcoString>,
-
-    /// The raw file buffer of syntax theme file.
-    #[internal]
-    #[parse(theme_data.map(Some))]
-    pub theme_data: Option<Bytes>,
+    #[parse(parse_theme(args)?.map(Some))]
+    pub theme: Option<Bytes>,
 
     /// The size for a tab stop in spaces. A tab is replaced with enough spaces to
     /// align with the next multiple of the size.
@@ -281,11 +263,11 @@ impl Show for RawElem {
             .or(Some("txt".into()));
 
         let extra_syntaxes = UnsyncLazy::new(|| {
-            load_syntaxes(&self.syntaxes(styles), &self.syntaxes_data(styles)).unwrap()
+            load_syntaxes(&self.syntaxes(styles)).unwrap()
         });
 
-        let theme = self.theme(styles).map(|theme_path| {
-            load_theme(theme_path, self.theme_data(styles).unwrap()).unwrap()
+        let theme = self.theme(styles).map(|theme| {
+            load_theme(theme).unwrap()
         });
 
         let theme = theme.as_deref().unwrap_or(&THEME);
@@ -462,18 +444,18 @@ fn to_syn(RgbaColor { r, g, b, a }: RgbaColor) -> synt::Color {
     synt::Color { r, g, b, a }
 }
 
-/// A list of bibliography file paths.
+/// A list of syntaxes.
 #[derive(Debug, Default, Clone, Hash)]
-pub struct SyntaxPaths(Vec<EcoString>);
+pub struct Syntaxes(Vec<EcoString>);
 
 cast! {
-    SyntaxPaths,
+    Syntaxes,
     self => self.0.into_value(),
     v: EcoString => Self(vec![v]),
     v: Array => Self(v.into_iter().map(Value::cast).collect::<StrResult<_>>()?),
 }
 
-impl Fold for SyntaxPaths {
+impl Fold for Syntaxes {
     type Output = Self;
 
     fn fold(mut self, outer: Self::Output) -> Self::Output {
@@ -484,14 +466,14 @@ impl Fold for SyntaxPaths {
 
 /// Load a syntax set from a list of syntax file paths.
 #[comemo::memoize]
-fn load_syntaxes(paths: &SyntaxPaths, bytes: &[Bytes]) -> StrResult<Arc<SyntaxSet>> {
+fn load_syntaxes(syntax: &[EcoString]) -> StrResult<Arc<SyntaxSet>> {
     let mut out = SyntaxSetBuilder::new();
 
     // We might have multiple sublime-syntax/yaml files
-    for (path, bytes) in paths.0.iter().zip(bytes.iter()) {
-        let src = std::str::from_utf8(bytes).map_err(FileError::from)?;
+    for syntax in syntax.iter() {
+        let src = syntax.as_str();
         out.add(SyntaxDefinition::load_from_str(src, false, None).map_err(|err| {
-            eco_format!("failed to parse syntax file `{path}` ({err})")
+            eco_format!("failed to parse syntax ({err})")
         })?);
     }
 
@@ -501,59 +483,49 @@ fn load_syntaxes(paths: &SyntaxPaths, bytes: &[Bytes]) -> StrResult<Arc<SyntaxSe
 /// Function to parse the syntaxes argument.
 /// Much nicer than having it be part of the `element` macro.
 fn parse_syntaxes(
-    vm: &mut Vm,
     args: &mut Args,
-) -> SourceResult<(Option<SyntaxPaths>, Option<Vec<Bytes>>)> {
-    let Some(Spanned { v: paths, span }) =
-        args.named::<Spanned<SyntaxPaths>>("syntaxes")?
+) -> SourceResult<Option<Vec<EcoString>>> {
+    let Some(Spanned { v: syntaxes, span }) =
+        args.named::<Spanned<Syntaxes>>("syntaxes")?
     else {
-        return Ok((None, None));
+        return Ok(None);
     };
 
     // Load syntax files.
-    let data = paths
-        .0
-        .iter()
-        .map(|path| {
-            let id = vm.resolve_path(path).at(span)?;
-            vm.world().file(id).at(span)
-        })
-        .collect::<SourceResult<Vec<Bytes>>>()?;
+    let data = syntaxes
+        .0;
 
     // Check that parsing works.
-    let _ = load_syntaxes(&paths, &data).at(span)?;
+    let _ = load_syntaxes(&data).at(span)?;
 
-    Ok((Some(paths), Some(data)))
+    Ok(Some(data))
 }
 
 #[comemo::memoize]
-fn load_theme(path: EcoString, bytes: Bytes) -> StrResult<Arc<synt::Theme>> {
+fn load_theme(bytes: Bytes) -> StrResult<Arc<synt::Theme>> {
     let mut cursor = std::io::Cursor::new(bytes.as_slice());
 
     synt::ThemeSet::load_from_reader(&mut cursor)
         .map(Arc::new)
-        .map_err(|err| eco_format!("failed to parse theme file `{path}` ({err})"))
+        .map_err(|err| eco_format!("failed to parse theme ({err})"))
 }
 
 /// Function to parse the theme argument.
 /// Much nicer than having it be part of the `element` macro.
 fn parse_theme(
-    vm: &mut Vm,
     args: &mut Args,
-) -> SourceResult<(Option<EcoString>, Option<Bytes>)> {
+) -> SourceResult<Option<Bytes>> {
     let Some(Spanned { v: path, span }) = args.named::<Spanned<EcoString>>("theme")?
     else {
-        return Ok((None, None));
+        return Ok(None);
     };
 
-    // Load theme file.
-    let id = vm.resolve_path(&path).at(span)?;
-    let data = vm.world().file(id).at(span)?;
+    let data = Bytes::from(path.as_bytes());
 
     // Check that parsing works.
-    let _ = load_theme(path.clone(), data.clone()).at(span)?;
+    let _ = load_theme(data.clone()).at(span)?;
 
-    Ok((Some(path), Some(data)))
+    Ok(Some(data))
 }
 
 /// The syntect syntax definitions.
